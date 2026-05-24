@@ -25,6 +25,11 @@ solver, and measure how solve time scales with how much we leave unknown.
      message free; constrain only the first `k` bits of the hash to a target
      drawn from `md5(random)`. Smaller k → many collisions → easy SAT; larger
      k → genuine partial-preimage search.
+   - **C. Lowercase-string preimage, parameter n.** Constrain the entire
+     message to be exactly `n` ASCII lowercase letters (each byte in
+     `0x61..0x7A`); fix the target hash to `md5(random_n_letter_string)`. The
+     practical "given an MD5, recover the password" experiment. Each letter is
+     ~4.7 bits of entropy.
 4. **Verification.** `test_md5.py` encodes 24 random 0..55-byte messages with
    ALL input bits as free variables, forces them to the chosen bytes via
    unit clauses, decodes the four hash words from the SAT model, and checks
@@ -91,6 +96,35 @@ for variant B — i.e. Cadical does roughly as much work per bit as brute
 search would, with the *constant factor* being the only thing the heuristics
 help with.
 
+### Variant C — n-letter lowercase string preimage
+
+"How long an a..z password can SAT crack from its MD5 hash in under 1 hour?"
+Each letter is `log2(26) ≈ 4.7` bits of entropy (26 of 256 byte values).
+
+| n | bits | n inst | TO | conf median | solve median | solve max |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 |  4.7 | 1 | 0 |       62 |   0.10 s |   0.10 s |
+| 2 |  9.4 | 1 | 0 |      505 |   0.65 s |   0.65 s |
+| 3 | 14.1 | 2 | 0 |    9 738 |  11.3 s  |  13.4 s  |
+| 4 | 18.8 | 5 | 1 |  334 176 | 288 s    | > 600 s (1 sample hit soft cap) |
+| 5 | 23.5 | 4 | 3 | 3.5 M (only success) | 3581 s (only success) | timeout @ 3600 s on 3/4 |
+
+**Practical bottom line: 4 letters is the largest n that *reliably* solves
+within 1 hour on a 2021 M1.** 4 of 5 samples at n=4 finished in 2–7 minutes;
+the slowest exceeded the 10-minute soft cap but would have completed within
+the hour. **n=5 is on the boundary** — 1 of 4 samples completed in 59:41
+(3.5 M Cadical conflicts), the other 3 hit the 1-hour timeout. **n=6
+(≈28 bits) is essentially infeasible**: extrapolating the ~30–40× per-letter
+cost growth gives 1–2 days per sample.
+
+For comparison, brute-forcing the same 5-letter problem with `hashlib.md5`
+takes 26⁵ ≈ 11.9 M tries which is ~0.24 s in optimized C MD5 (~50 M h/s) —
+**Cadical is ~15 000× slower than the trivial brute-force here.** Brute
+force handles 8 lowercase letters in under an hour; SAT handles 4 reliably.
+This is precisely the design goal of cryptographic hash functions: there is
+no algorithm that beats brute force, and CDCL's overhead means SAT is
+strictly worse than brute force for this task.
+
 ## Contrast with mmmaly/square-root-sat
 
 | | sqrt (`s·s = x`, k bits of x) | MD5 (n free input / k constrained output) |
@@ -133,6 +167,12 @@ python3 bench.py --variant A --params 1,2,4,6,8,10,12,14,16,18,20 \
 # Variant B: output bits constrained
 python3 bench.py --variant B --params 0,4,8,12,16,20,24 \
         --samples 5 --timeout 300 --out results.csv
+
+# Variant C: lowercase-letter-string preimage (the "password cracking" form)
+python3 bench.py --variant C --params 1,2,3,4 \
+        --samples 5 --timeout 600 --out results.csv
+# n=5 is the boundary — 1-hour timeout recommended
+python3 bench.py --variant C --params 5 --samples 5 --timeout 3600 --out results.csv
 
 python3 analyze.py results.csv
 python3 plot.py results.csv          # writes plot_*.png

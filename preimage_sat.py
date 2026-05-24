@@ -182,6 +182,112 @@ def solve_output_constrained(message_len: int, k_output_bits: int,
 
 
 # ---------------------------------------------------------------------------
+# Variant C: n-letter ASCII-lowercase string preimage
+# ---------------------------------------------------------------------------
+
+def _constrain_lowercase_letter(cnf: CNF, byte_lits: list[int]) -> None:
+    """Constrain a list of 8 CNF literals (LSB first) to represent a byte in
+    the range 0x61..0x7A (ASCII lowercase a..z).
+
+    Bits 5, 6, 7 of every lowercase letter are 1, 1, 0 respectively, so we
+    fix them as unit clauses. Bits 0..4 take 32 possible values; we have to
+    forbid 6 of them: 0x00 (would give 0x60 == '`') and 0x1B..0x1F (would
+    give 0x7B..0x7F). Each forbidden value adds one clause of length 5
+    that asserts the AND of complements (i.e. at least one bit differs).
+    """
+    b0, b1, b2, b3, b4, b5, b6, b7 = byte_lits
+    cnf.fix_bit(b5, 1)
+    cnf.fix_bit(b6, 1)
+    cnf.fix_bit(b7, 0)
+    forbidden_lower5 = [0x00, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F]
+    for val in forbidden_lower5:
+        # clause: at least one of (b0..b4) differs from val
+        clause = []
+        for i, lit in enumerate([b0, b1, b2, b3, b4]):
+            bit = (val >> i) & 1
+            clause.append(cnf.neg(lit) if bit else lit)
+        # filter out trivially-true literals (TRUE) — those make clause SAT for free
+        if any(c == cnf.TRUE for c in clause):
+            continue
+        # drop FALSE literals (they don't help)
+        clause = [c for c in clause if c != cnf.FALSE]
+        if clause:
+            cnf.add_clause(clause)
+
+
+def build_letter_string_cnf(n_chars: int, target_hash_words: list[int]
+                            ) -> tuple[CNF, list[list[int]], list[list[int]]]:
+    """Build CNF: 'find an n_chars-letter lowercase ASCII string whose
+    MD5 hash equals target_hash_words'.
+
+    Implementation: allocate fresh CNF vars for all 8 bits of every input
+    byte (so the encoder doesn't fold), constrain each input byte to a
+    lowercase letter, then force the output to the target.
+    """
+    if n_chars < 0 or n_chars > 55:
+        raise ValueError("n_chars must be in 0..55")
+    cnf = CNF()
+    zero_msg = bytes(n_chars)  # dummy; bits will be freed below
+    free = list(range(n_chars * 8))
+    block_words, hash_words = md5_cnf_from_bytes(cnf, zero_msg, free_bit_positions=free)
+    # Constrain each input byte to be a lowercase ASCII letter.
+    for byte_idx in range(n_chars):
+        w_index = byte_idx // 4
+        # bits (LSB first) of byte `byte_idx` are at positions [4*(byte_idx%4)*8 .. +8)
+        # in word w_index? No — bit_in_word = (byte_idx % 4) * 8 + b for b in 0..7.
+        # So byte_lits = block_words[w_index][offset..offset+8]
+        offset = (byte_idx % 4) * 8
+        byte_lits = block_words[w_index][offset:offset + 8]
+        _constrain_lowercase_letter(cnf, byte_lits)
+    # Force the output hash to the target.
+    for word_idx, target_word in enumerate(target_hash_words):
+        for bit_idx in range(32):
+            lit = hash_words[word_idx][bit_idx]
+            v = (target_word >> bit_idx) & 1
+            cnf.fix_bit(lit, v)
+    return cnf, block_words, hash_words
+
+
+def solve_letter_string_preimage(n_chars: int,
+                                  target_hash_words: list[int]) -> PreimageResult:
+    t0 = time.perf_counter()
+    cnf, block_words, _ = build_letter_string_cnf(n_chars, target_hash_words)
+    t1 = time.perf_counter()
+    solver = Cadical195(bootstrap_with=cnf.clauses)
+    t2 = time.perf_counter()
+    sat = solver.solve()
+    t3 = time.perf_counter()
+    stats = solver.accum_stats()
+    witness: bytes | None = None
+    if sat:
+        model = set(solver.get_model())
+        out = bytearray(n_chars)
+        for byte_idx in range(n_chars):
+            w_index = byte_idx // 4
+            byte_val = 0
+            for b in range(8):
+                bit_in_word = (byte_idx % 4) * 8 + b
+                lit = block_words[w_index][bit_in_word]
+                if lit == cnf.TRUE: bit = 1
+                elif lit == cnf.FALSE: bit = 0
+                elif lit > 0: bit = 1 if lit in model else 0
+                else: bit = 0 if -lit in model else 1
+                byte_val |= (bit << b)
+            out[byte_idx] = byte_val
+        witness = bytes(out)
+    solver.delete()
+    return PreimageResult(
+        sat=bool(sat), witness=witness,
+        n_vars=cnf.n_vars, n_clauses=len(cnf.clauses),
+        encode_s=t1 - t0, bootstrap_s=t2 - t1, solve_s=t3 - t2,
+        conflicts=stats.get("conflicts", 0),
+        decisions=stats.get("decisions", 0),
+        propagations=stats.get("propagations", 0),
+        restarts=stats.get("restarts", 0),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Demo: quick smoke test
 # ---------------------------------------------------------------------------
 

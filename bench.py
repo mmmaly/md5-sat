@@ -43,6 +43,15 @@ def _worker_output_bits(args, conn) -> None:
     conn.close()
 
 
+def _worker_letter_string(args, conn) -> None:
+    """Variant C worker: lowercase-letter-string preimage."""
+    n_chars, target = args
+    from preimage_sat import solve_letter_string_preimage
+    r = solve_letter_string_preimage(n_chars, target)
+    conn.send(_to_dict(r))
+    conn.close()
+
+
 def _to_dict(r) -> dict:
     return {
         "sat": r.sat,
@@ -95,8 +104,9 @@ def fmt(r: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", choices=["A", "B"], required=True,
-                    help="A=free input bits, B=output bits constrained")
+    ap.add_argument("--variant", choices=["A", "B", "C"], required=True,
+                    help="A=free input bits, B=output bits constrained, "
+                         "C=n-letter lowercase string preimage")
     ap.add_argument("--params", type=str, required=True,
                     help="comma-separated parameter values (n for A, k for B)")
     ap.add_argument("--samples", type=int, default=10)
@@ -135,15 +145,24 @@ def main() -> int:
                 wargs = (msg, free, target_full)
                 worker = _worker_free_input
                 extra = f"free_positions={','.join(map(str, sorted(free)))}"
-            else:
-                # For variant B we want each sample to have a different target.
-                # Generate a random short message and hash IT, then constrain k bits.
+            elif args.variant == "B":
+                # For variant B each sample uses a different random target.
                 rand_msg = bytes(rng.randint(0, 255) for _ in range(args.message_len))
                 h_r = hashlib.md5(rand_msg).digest()
                 tgt = [int.from_bytes(h_r[i:i+4], "little") for i in range(0, 16, 4)]
                 wargs = (args.message_len, p, tgt)
                 worker = _worker_output_bits
                 extra = f"target_hash={h_r.hex()}"
+            else:  # variant C
+                # Generate a random p-letter lowercase string, hash it, ask the
+                # solver to find a (possibly different) p-letter lowercase
+                # preimage of that hash.
+                rand_str = bytes(rng.randint(ord('a'), ord('z')) for _ in range(p))
+                h_r = hashlib.md5(rand_str).digest()
+                tgt = [int.from_bytes(h_r[i:i+4], "little") for i in range(0, 16, 4)]
+                wargs = (p, tgt)
+                worker = _worker_letter_string
+                extra = f"orig_string={rand_str.decode()} target_hash={h_r.hex()}"
             r = run_one(worker, wargs, args.timeout)
             print(f"{args.variant}={p:3d} #{s}: {fmt(r)}", flush=True)
             row = {"variant": args.variant, "param": p, "sample": s,
