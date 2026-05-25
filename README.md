@@ -96,6 +96,42 @@ for variant B — i.e. Cadical does roughly as much work per bit as brute
 search would, with the *constant factor* being the only thing the heuristics
 help with.
 
+### Variant D — combined MD5 ∧ SHA-1 lowercase preimage
+
+The same lowercase-letter-string preimage problem as variant C, but now the
+input must hash to a given MD5 *and* a given SHA-1 simultaneously. Tests
+whether two independent hash constraints "symbiose" in CDCL — does adding
+SHA-1 help Cadical find a preimage faster than MD5 alone? We use the same
+seeds as variant C so the random target strings are pair-identical.
+
+Combined formula size: ~80k vars / 274k clauses (vs MD5-only's 33k / 112k).
+
+Paired n=4 results (5 samples, same target strings as C):
+
+| sample | MD5-only conflicts | combined conflicts | conflicts Δ | wall Δ |
+|---:|---:|---:|---:|---:|
+| 0 | 501 k | 407 k | −19% | +30% |
+| 1 | 169 k | 145 k | −14% | +36% |
+| 2 | 473 k | 281 k | **−41%** | +10% |
+| 3 | TIMEOUT @ 600 s | **423 s / 338 k**  | (D solved when C couldn't) | — |
+| 4 | 334 k | 776 k | +132% | +300% |
+
+At n=3 and n=4, **combined needs ~20% fewer conflicts on average** — there
+*is* real cross-constraint propagation. But the formula is ~2.5× bigger so
+each conflict costs more, and median wall time grows ~1.3×.
+
+At n=5 (~23.5 bits), 0 of 2 attempted samples solved within 1 hour (vs
+MD5-only's 1 of 4) — combined did **not** extend the practical boundary.
+
+The "symbiosis" is real but small. Intuition: the two hashes share only
+the input bits; their internal mixing networks have no shared state, so a
+learned clause from MD5's round 32 carries no information about SHA-1's
+round 32. Cadical gets the trivial sharing (input-bit unit propagation)
+but nothing structural. ~20% conflict reduction is consistent with the
+mild win you'd predict from "two independent random oracles agreeing on
+the input". It is not enough to overcome the constant-factor cost of the
+combined formula.
+
 ### Variant C — n-letter lowercase string preimage
 
 "How long an a..z password can SAT crack from its MD5 hash in under 1 hour?"
@@ -146,7 +182,9 @@ functions are *designed* to produce.
 | --- | --- |
 | `circuit.py` | Tseitin CNF encoder + 32-bit word ops (rotate-left, mod-2^32 add, AND/OR/XOR/NOT). |
 | `md5_cnf.py` | One-block MD5: round constants, message-word permutation, the 64-round compression, IV finalization. Plus a pure-Python reference MD5 cross-check. |
+| `sha1_cnf.py` | One-block SHA-1: 80 rounds + message expansion, big-endian byte layout + length suffix. Pure-Python reference cross-check. |
 | `test_md5.py` | Verifies the CNF MD5 agrees with `hashlib.md5` on 24 random messages. |
+| `test_sha1.py` | Verifies the CNF SHA-1 agrees with `hashlib.sha1` on 24 random messages. |
 | `preimage_sat.py` | `solve_free_input(...)` and `solve_output_constrained(...)`. |
 | `bench.py` | Driver: sweep parameter, samples-per-value, isolated workers + timeout. CSV streaming output. |
 | `analyze.py` | Per-parameter summary table + exponential vs polynomial growth fits. |
@@ -173,6 +211,10 @@ python3 bench.py --variant C --params 1,2,3,4 \
         --samples 5 --timeout 600 --out results.csv
 # n=5 is the boundary — 1-hour timeout recommended
 python3 bench.py --variant C --params 5 --samples 5 --timeout 3600 --out results.csv
+
+# Variant D: combined MD5+SHA-1 preimage (tests "do two hashes help SAT?")
+python3 bench.py --variant D --params 3,4 --samples 5 --timeout 1500 --out results.csv
+python3 bench.py --variant D --params 5 --samples 3 --timeout 3600 --out results.csv
 
 python3 analyze.py results.csv
 python3 plot.py results.csv          # writes plot_*.png

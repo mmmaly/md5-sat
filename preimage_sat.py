@@ -23,6 +23,9 @@ from pysat.solvers import Cadical195
 
 from circuit import CNF
 from md5_cnf import md5_cnf_from_bytes, reference_md5, hash_words_to_bytes
+from md5_cnf import md5_block_cnf
+from sha1_cnf import sha1_block_cnf
+from sha1_cnf import hash_words_to_bytes as sha1_hash_words_to_bytes
 
 
 @dataclass
@@ -268,6 +271,159 @@ def solve_letter_string_preimage(n_chars: int,
             for b in range(8):
                 bit_in_word = (byte_idx % 4) * 8 + b
                 lit = block_words[w_index][bit_in_word]
+                if lit == cnf.TRUE: bit = 1
+                elif lit == cnf.FALSE: bit = 0
+                elif lit > 0: bit = 1 if lit in model else 0
+                else: bit = 0 if -lit in model else 1
+                byte_val |= (bit << b)
+            out[byte_idx] = byte_val
+        witness = bytes(out)
+    solver.delete()
+    return PreimageResult(
+        sat=bool(sat), witness=witness,
+        n_vars=cnf.n_vars, n_clauses=len(cnf.clauses),
+        encode_s=t1 - t0, bootstrap_s=t2 - t1, solve_s=t3 - t2,
+        conflicts=stats.get("conflicts", 0),
+        decisions=stats.get("decisions", 0),
+        propagations=stats.get("propagations", 0),
+        restarts=stats.get("restarts", 0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Variant D: combined MD5 AND SHA-1 lowercase-string preimage
+# ---------------------------------------------------------------------------
+
+def _build_md5_block_from_msg_bits(cnf: CNF, msg_bytes_bits: list[list[int]]) -> list[list[int]]:
+    """Build a 16-word MD5 input block from the given list of message bytes
+    (each byte = 8 LSB-first literals). Pads with 0x80, zeros, and a
+    little-endian 64-bit length suffix.
+    """
+    n = len(msg_bytes_bits)
+    if n > 55:
+        raise ValueError("≤55-byte messages only")
+    block_words: list[list[int]] = []
+    bit_len = n * 8
+    pad_bytes = bytearray(64)
+    # length-bytes will be little-endian for MD5
+    length_le = bit_len.to_bytes(8, "little")
+    for i in range(64):
+        if i < n:
+            pad_bytes[i] = 0  # placeholder, real bits come from msg_bytes_bits
+        elif i == n:
+            pad_bytes[i] = 0x80
+        elif i < 56:
+            pad_bytes[i] = 0x00
+        else:
+            pad_bytes[i] = length_le[i - 56]
+    for w_index in range(16):
+        word_literals = [cnf.FALSE] * 32
+        for byte_in_word in range(4):
+            byte_index = w_index * 4 + byte_in_word
+            # In MD5 (little-endian), byte_in_word=0 is least-significant byte
+            # → bits [0..7]; byte_in_word=1 → [8..15]; etc.
+            base = byte_in_word * 8
+            if byte_index < n:
+                # use the actual msg bits
+                for b in range(8):
+                    word_literals[base + b] = msg_bytes_bits[byte_index][b]
+            else:
+                # constant byte
+                v = pad_bytes[byte_index]
+                for b in range(8):
+                    word_literals[base + b] = cnf.TRUE if ((v >> b) & 1) else cnf.FALSE
+        block_words.append(word_literals)
+    return block_words
+
+
+def _build_sha1_block_from_msg_bits(cnf: CNF, msg_bytes_bits: list[list[int]]) -> list[list[int]]:
+    """Build a 16-word SHA-1 input block (big-endian byte order + big-endian
+    length suffix) from the same list of message bytes."""
+    n = len(msg_bytes_bits)
+    if n > 55:
+        raise ValueError("≤55-byte messages only")
+    bit_len = n * 8
+    pad_bytes = bytearray(64)
+    length_be = bit_len.to_bytes(8, "big")
+    for i in range(64):
+        if i < n:
+            pad_bytes[i] = 0
+        elif i == n:
+            pad_bytes[i] = 0x80
+        elif i < 56:
+            pad_bytes[i] = 0x00
+        else:
+            pad_bytes[i] = length_be[i - 56]
+    block_words: list[list[int]] = []
+    for w_index in range(16):
+        word_literals = [cnf.FALSE] * 32
+        for byte_in_word in range(4):
+            byte_index = w_index * 4 + byte_in_word
+            # SHA-1 big-endian: byte_in_word=0 is MOST significant byte →
+            # bits [24..31]; byte_in_word=3 → [0..7].
+            base = (3 - byte_in_word) * 8
+            if byte_index < n:
+                for b in range(8):
+                    word_literals[base + b] = msg_bytes_bits[byte_index][b]
+            else:
+                v = pad_bytes[byte_index]
+                for b in range(8):
+                    word_literals[base + b] = cnf.TRUE if ((v >> b) & 1) else cnf.FALSE
+        block_words.append(word_literals)
+    return block_words
+
+
+def build_combined_md5_sha1_letter_cnf(n_chars: int,
+                                       target_md5_words: list[int],
+                                       target_sha1_words: list[int]
+                                       ) -> tuple[CNF, list[list[int]]]:
+    """Build CNF: 'find n_chars lowercase letters whose MD5 hash equals
+    target_md5_words AND whose SHA-1 hash equals target_sha1_words'.
+
+    Returns (cnf, msg_bytes_bits). msg_bytes_bits[i] is the 8-literal
+    LSB-first representation of byte i.
+    """
+    if n_chars < 0 or n_chars > 55:
+        raise ValueError("0 ≤ n_chars ≤ 55")
+    cnf = CNF()
+    msg_bytes_bits = [[cnf.new_var() for _ in range(8)] for _ in range(n_chars)]
+    for byte_lits in msg_bytes_bits:
+        _constrain_lowercase_letter(cnf, byte_lits)
+    # MD5
+    md5_block = _build_md5_block_from_msg_bits(cnf, msg_bytes_bits)
+    md5_hash = md5_block_cnf(cnf, md5_block)
+    for word_idx, target_word in enumerate(target_md5_words):
+        for bit_idx in range(32):
+            cnf.fix_bit(md5_hash[word_idx][bit_idx], (target_word >> bit_idx) & 1)
+    # SHA-1
+    sha1_block = _build_sha1_block_from_msg_bits(cnf, msg_bytes_bits)
+    sha1_hash = sha1_block_cnf(cnf, sha1_block)
+    for word_idx, target_word in enumerate(target_sha1_words):
+        for bit_idx in range(32):
+            cnf.fix_bit(sha1_hash[word_idx][bit_idx], (target_word >> bit_idx) & 1)
+    return cnf, msg_bytes_bits
+
+
+def solve_combined_md5_sha1_letter(n_chars: int,
+                                    target_md5_words: list[int],
+                                    target_sha1_words: list[int]) -> PreimageResult:
+    t0 = time.perf_counter()
+    cnf, msg_bytes_bits = build_combined_md5_sha1_letter_cnf(
+        n_chars, target_md5_words, target_sha1_words)
+    t1 = time.perf_counter()
+    solver = Cadical195(bootstrap_with=cnf.clauses)
+    t2 = time.perf_counter()
+    sat = solver.solve()
+    t3 = time.perf_counter()
+    stats = solver.accum_stats()
+    witness: bytes | None = None
+    if sat:
+        model = set(solver.get_model())
+        out = bytearray(n_chars)
+        for byte_idx in range(n_chars):
+            byte_val = 0
+            for b in range(8):
+                lit = msg_bytes_bits[byte_idx][b]
                 if lit == cnf.TRUE: bit = 1
                 elif lit == cnf.FALSE: bit = 0
                 elif lit > 0: bit = 1 if lit in model else 0

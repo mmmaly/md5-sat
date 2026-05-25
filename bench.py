@@ -44,10 +44,19 @@ def _worker_output_bits(args, conn) -> None:
 
 
 def _worker_letter_string(args, conn) -> None:
-    """Variant C worker: lowercase-letter-string preimage."""
+    """Variant C worker: lowercase-letter-string preimage (MD5 only)."""
     n_chars, target = args
     from preimage_sat import solve_letter_string_preimage
     r = solve_letter_string_preimage(n_chars, target)
+    conn.send(_to_dict(r))
+    conn.close()
+
+
+def _worker_combined_md5_sha1(args, conn) -> None:
+    """Variant D worker: lowercase-letter-string preimage of BOTH MD5 and SHA-1."""
+    n_chars, md5_target, sha1_target = args
+    from preimage_sat import solve_combined_md5_sha1_letter
+    r = solve_combined_md5_sha1_letter(n_chars, md5_target, sha1_target)
     conn.send(_to_dict(r))
     conn.close()
 
@@ -104,9 +113,10 @@ def fmt(r: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", choices=["A", "B", "C"], required=True,
+    ap.add_argument("--variant", choices=["A", "B", "C", "D"], required=True,
                     help="A=free input bits, B=output bits constrained, "
-                         "C=n-letter lowercase string preimage")
+                         "C=n-letter lowercase string preimage (MD5 only), "
+                         "D=n-letter lowercase string preimage of BOTH MD5 and SHA-1")
     ap.add_argument("--params", type=str, required=True,
                     help="comma-separated parameter values (n for A, k for B)")
     ap.add_argument("--samples", type=int, default=10)
@@ -153,7 +163,7 @@ def main() -> int:
                 wargs = (args.message_len, p, tgt)
                 worker = _worker_output_bits
                 extra = f"target_hash={h_r.hex()}"
-            else:  # variant C
+            elif args.variant == "C":
                 # Generate a random p-letter lowercase string, hash it, ask the
                 # solver to find a (possibly different) p-letter lowercase
                 # preimage of that hash.
@@ -163,6 +173,16 @@ def main() -> int:
                 wargs = (p, tgt)
                 worker = _worker_letter_string
                 extra = f"orig_string={rand_str.decode()} target_hash={h_r.hex()}"
+            else:  # variant D — both MD5 and SHA-1 of the same string
+                rand_str = bytes(rng.randint(ord('a'), ord('z')) for _ in range(p))
+                md5_r = hashlib.md5(rand_str).digest()
+                sha1_r = hashlib.sha1(rand_str).digest()
+                md5_tgt = [int.from_bytes(md5_r[i:i+4], "little") for i in range(0, 16, 4)]
+                sha1_tgt = [int.from_bytes(sha1_r[i:i+4], "big") for i in range(0, 20, 4)]
+                wargs = (p, md5_tgt, sha1_tgt)
+                worker = _worker_combined_md5_sha1
+                extra = (f"orig_string={rand_str.decode()} "
+                         f"md5={md5_r.hex()} sha1={sha1_r.hex()}")
             r = run_one(worker, wargs, args.timeout)
             print(f"{args.variant}={p:3d} #{s}: {fmt(r)}", flush=True)
             row = {"variant": args.variant, "param": p, "sample": s,
